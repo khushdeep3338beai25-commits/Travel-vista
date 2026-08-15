@@ -1,4 +1,4 @@
-# TravelVista – Live Travel Explorer
+# 🌎TravelVista – Live Travel Explorer
 
 TravelVista is a React + Vite travel application for exploring live country data, maps, current weather, currency rates, wishlists, comparisons, trip planning, and optional Gemini-powered itineraries.
 
