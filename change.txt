@@ -1,0 +1,432 @@
+Add these files inside the deployed project:
+
+`/Users/dhruv/Downloads/Travel-vista-main/`
+
+You can keep `server.mjs` for local development.
+
+### 1. Shared country service
+
+Create:
+
+`api/_lib/countries.js`
+
+```js
+const REST_COUNTRIES_BASE = 'https://api.restcountries.com/countries/v5';
+
+const RESPONSE_FIELDS = [
+  'names',
+  'codes.alpha_2',
+  'codes.alpha_3',
+  'region',
+  'subregion',
+  'population',
+  'flag.url_svg',
+  'flag.url_png',
+  'flag.description',
+  'capitals',
+  'currencies',
+  'languages',
+  'coordinates',
+  'borders',
+  'timezones',
+  'landlocked',
+  'area',
+  'memberships.un',
+].join(',');
+
+let countryCache = null;
+let countryCacheAt = 0;
+const CACHE_TTL = 10 * 60 * 1000;
+
+export function sendJson(res, status, body) {
+  res.status(status).json(body);
+}
+
+function normalizeCountry(country) {
+  const currencies = {};
+
+  for (const currency of country?.currencies || []) {
+    if (!currency?.code) continue;
+
+    currencies[currency.code] = {
+      name: currency.name || currency.code,
+      symbol: currency.symbol || '',
+    };
+  }
+
+  const languages = {};
+
+  for (const language of country?.languages || []) {
+    const key =
+      language?.bcp47 ||
+      language?.iso_639_3 ||
+      language?.name;
+
+    if (key && language?.name) {
+      languages[key] = language.name;
+    }
+  }
+
+  return {
+    name: {
+      common: country?.names?.common || '',
+      official:
+        country?.names?.official ||
+        country?.names?.common ||
+        '',
+    },
+    capital: (country?.capitals || [])
+      .map((capital) => capital?.name)
+      .filter(Boolean),
+    region: country?.region || '',
+    subregion: country?.subregion || '',
+    population: Number(country?.population || 0),
+    flags: {
+      svg: country?.flag?.url_svg || '',
+      png: country?.flag?.url_png || '',
+      alt:
+        country?.flag?.description ||
+        `${country?.names?.common || 'Country'} flag`,
+    },
+    cca2: country?.codes?.alpha_2 || '',
+    cca3: country?.codes?.alpha_3 || '',
+    currencies,
+    languages,
+    latlng: [
+      country?.coordinates?.lat,
+      country?.coordinates?.lng,
+    ].every(Number.isFinite)
+      ? [
+          country.coordinates.lat,
+          country.coordinates.lng,
+        ]
+      : [],
+    borders: Array.isArray(country?.borders)
+      ? country.borders
+      : [],
+    timezones: Array.isArray(country?.timezones)
+      ? country.timezones
+      : [],
+    unMember: Boolean(country?.memberships?.un),
+    landlocked: Boolean(country?.landlocked),
+    area: Number(country?.area?.kilometers || 0),
+  };
+}
+
+async function fetchRestCountries(url) {
+  const apiKey = process.env.REST_COUNTRIES_API_KEY;
+
+  if (!apiKey) {
+    const error = new Error(
+      'REST_COUNTRIES_API_KEY is not configured on Vercel.',
+    );
+    error.status = 503;
+    throw error;
+  }
+
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+    },
+    signal: AbortSignal.timeout(15000),
+  });
+
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const message =
+      payload?.errors?.[0]?.message ||
+      `REST Countries returned HTTP ${response.status}.`;
+
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
+
+  return payload;
+}
+
+export async function getAllCountries() {
+  if (
+    countryCache &&
+    Date.now() - countryCacheAt < CACHE_TTL
+  ) {
+    return countryCache;
+  }
+
+  const countries = [];
+  const limit = 100;
+  let offset = 0;
+  let hasMore = true;
+
+  while (hasMore) {
+    const url =
+      `${REST_COUNTRIES_BASE}` +
+      `?limit=${limit}` +
+      `&offset=${offset}` +
+      `&response_fields=${encodeURIComponent(RESPONSE_FIELDS)}`;
+
+    const payload = await fetchRestCountries(url);
+    const objects = payload?.data?.objects;
+
+    if (!Array.isArray(objects)) {
+      throw new Error(
+        'REST Countries returned an unexpected response.',
+      );
+    }
+
+    countries.push(...objects.map(normalizeCountry));
+
+    hasMore = Boolean(payload?.data?.meta?.more);
+    offset += objects.length;
+
+    if (!objects.length) hasMore = false;
+  }
+
+  if (!countries.length) {
+    throw new Error('REST Countries returned no countries.');
+  }
+
+  countryCache = countries;
+  countryCacheAt = Date.now();
+
+  return countries;
+}
+```
+
+### 2. All-countries endpoint
+
+Create:
+
+`api/countries/index.js`
+
+```js
+import {
+  getAllCountries,
+  sendJson,
+} from '../_lib/countries.js';
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    res.setHeader('Allow', 'GET');
+    return sendJson(res, 405, {
+      error: 'Method not allowed',
+    });
+  }
+
+  try {
+    const countries = await getAllCountries();
+    return sendJson(res, 200, { data: countries });
+  } catch (error) {
+    console.error('Country request failed:', error);
+
+    return sendJson(res, error.status || 502, {
+      error: `Unable to load live country data: ${error.message}`,
+    });
+  }
+}
+```
+
+### 3. Country-code endpoint
+
+Create:
+
+`api/countries/code.js`
+
+```js
+import {
+  getAllCountries,
+  sendJson,
+} from '../_lib/countries.js';
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    res.setHeader('Allow', 'GET');
+    return sendJson(res, 405, {
+      error: 'Method not allowed',
+    });
+  }
+
+  const rawCode = Array.isArray(req.query.code)
+    ? req.query.code[0]
+    : req.query.code;
+
+  const code = rawCode?.trim().toUpperCase();
+
+  if (!code) {
+    return sendJson(res, 400, {
+      error: 'Country code is required.',
+    });
+  }
+
+  try {
+    const countries = await getAllCountries();
+
+    const country =
+      countries.find(
+        (item) =>
+          item.cca2 === code || item.cca3 === code,
+      ) || null;
+
+    return sendJson(res, 200, { data: country });
+  } catch (error) {
+    console.error('Country lookup failed:', error);
+
+    return sendJson(res, error.status || 502, {
+      error: `Unable to load country data: ${error.message}`,
+    });
+  }
+}
+```
+
+### 4. Health endpoint
+
+Create:
+
+`api/health.js`
+
+```js
+export default function handler(req, res) {
+  if (req.method !== 'GET') {
+    res.setHeader('Allow', 'GET');
+
+    return res.status(405).json({
+      error: 'Method not allowed',
+    });
+  }
+
+  return res.status(200).json({
+    ok: true,
+    geminiConfigured: Boolean(
+      process.env.GEMINI_API_KEY,
+    ),
+    restCountriesConfigured: Boolean(
+      process.env.REST_COUNTRIES_API_KEY,
+    ),
+  });
+}
+```
+
+### 5. AI endpoint
+
+Create:
+
+`api/ai/travel-plan.js`
+
+```js
+import { GoogleGenAI } from '@google/genai';
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+
+    return res.status(405).json({
+      error: 'Method not allowed',
+    });
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    return res.status(503).json({
+      error:
+        'AI is not configured. Add GEMINI_API_KEY on Vercel.',
+    });
+  }
+
+  const body =
+    typeof req.body === 'string'
+      ? JSON.parse(req.body || '{}')
+      : req.body || {};
+
+  const {
+    prompt,
+    countryName = '',
+  } = body;
+
+  if (typeof prompt !== 'string' || !prompt.trim()) {
+    return res.status(400).json({
+      error: 'A travel prompt is required.',
+    });
+  }
+
+  if (prompt.length > 4000) {
+    return res.status(413).json({
+      error: 'Prompt is too long.',
+    });
+  }
+
+  try {
+    const ai = new GoogleGenAI({ apiKey });
+
+    const instruction = `
+You are TravelVista AI, a careful travel planning assistant.
+
+User request: ${prompt.trim()}
+${countryName ? `Focus country: ${countryName}` : ''}
+
+Provide practical, clearly labelled itinerary ideas, food
+suggestions, etiquette, transport notes, budget ranges, and
+best-time guidance.
+
+Do not invent live prices, availability, closures, or safety
+conditions. Clearly identify information requiring current
+verification.
+    `.trim();
+
+    const result = await ai.models.generateContent({
+      model: 'gemini-3.6-flash',
+      contents: instruction,
+    });
+
+    return res.status(200).json({
+      content: result.text || '',
+    });
+  } catch (error) {
+    console.error('Gemini request failed:', error);
+
+    return res.status(502).json({
+      error: 'The AI provider could not complete the request.',
+    });
+  }
+}
+```
+
+### 6. Vercel routing
+
+Create this at the project root:
+
+`vercel.json`
+
+```json
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}
+```
+
+Vercel checks deployed API functions before applying the SPA fallback. This makes URLs such as `/destinations`, `/planner`, and `/destination/IND` work when refreshed.
+
+### 7. Configure Vercel variables
+
+In **Vercel → Project → Settings → Environment Variables**, add:
+
+```text
+REST_COUNTRIES_API_KEY=your_real_key
+GEMINI_API_KEY=your_real_key
+```
+
+Do not use the `VITE_` prefix for either secret.
+
+After pushing these files and redeploying, test:
+
+```text
+https://travel-vista-travelguide.vercel.app/api/health
+https://travel-vista-travelguide.vercel.app/api/countries
+https://travel-vista-travelguide.vercel.app/destinations
+```
